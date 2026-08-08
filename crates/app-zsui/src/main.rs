@@ -5,6 +5,7 @@ mod windows_startup;
 use std::{
     env, fs,
     path::PathBuf,
+    process::Command,
     sync::{Arc, Mutex},
     thread,
     time::Duration,
@@ -75,6 +76,8 @@ const HOME_TASKS_BUTTON: WidgetId = WidgetId::new(448);
 const HOME_STORAGE_BUTTON: WidgetId = WidgetId::new(449);
 const RESOURCE_DETAIL_DIALOG: WidgetId = WidgetId::new(450);
 const STATUS_INFO_BAR: WidgetId = WidgetId::new(451);
+const OPEN_REPOSITORY_BUTTON: WidgetId = WidgetId::new(452);
+const REPOSITORY_URL: &str = "https://github.com/qiu7824/CodexCleaner";
 
 const TASKS_PER_PAGE: usize = 5;
 const RESOURCES_PER_PAGE: usize = 6;
@@ -316,6 +319,7 @@ enum Msg {
     HistoryNextPage,
     RefreshHistory,
     DarkModeChanged(bool),
+    OpenRepository,
     ExecuteDialogResult(ZsContentDialogResult),
 }
 
@@ -548,6 +552,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 .screenshot_file(artifact_dir.join("window.png").to_string_lossy())
                 .require_screenshot(true)
                 .native_view_clicks([Point { x: 860, y: 428 }]);
+        } else if args.iter().any(|value| value == "--smoke-navigation") {
+            smoke_options = NativeWindowSmokeRunOptions::new(7000)
+                .screenshot_file(artifact_dir.join("window.png").to_string_lossy())
+                .require_screenshot(true)
+                .native_view_clicks([Point { x: 80, y: 164 }]);
         } else if args.iter().any(|value| value == "--smoke-project-filter") {
             smoke_options = NativeWindowSmokeRunOptions::new(7000)
                 .screenshot_file(artifact_dir.join("window.png").to_string_lossy())
@@ -672,7 +681,9 @@ fn render_view(state: &AppState) -> ViewNode<Msg> {
     ]
     .into_iter()
     .map(|(page, id)| {
-        navigation_item(page.label(), page.icon(), page == state.page)
+        let selected = page == state.page;
+        navigation_item(page.label(), page.icon(), selected)
+            .enabled(!selected)
             .id(id)
             .on_click(Msg::Navigate(page))
     });
@@ -1624,12 +1635,23 @@ fn view_settings(state: &AppState) -> ViewNode<Msg> {
             body_text("✓ 安全缓存规则要求至少 7 天未活动"),
         ],
     );
-    let about = status_bar_text(format!(
-        "Codex Cleaner {} · Rust · ZSUI 0.2.0-preview.6（本地源码）",
-        env!("CARGO_PKG_VERSION")
-    ))
-    .min_height(Dp::new(24.0));
-    column([appearance, scanning, locations, safety, about])
+    let open_source = section(
+        "开源项目",
+        [row([
+            column([
+                body_strong(format!("Codex Cleaner {}", env!("CARGO_PKG_VERSION"))),
+                secondary_text(REPOSITORY_URL, TextRole::Caption),
+                secondary_text("Rust · ZSUI 0.2.0-preview.6（本地源码）", TextRole::Caption),
+            ])
+            .gap(Dp::new(2.0)),
+            spacer().flex(1.0),
+            button("打开 GitHub")
+                .id(OPEN_REPOSITORY_BUTTON)
+                .on_click(Msg::OpenRepository),
+        ])
+        .min_height(Dp::new(58.0))],
+    );
+    column([appearance, scanning, locations, safety, open_source])
         .flex(1.0)
         .gap(Dp::new(10.0))
 }
@@ -2646,6 +2668,12 @@ fn update(state: &mut AppState, msg: Msg, _cx: &mut AppCx) {
                 "已切换为浅色界面".to_string()
             };
         }
+        Msg::OpenRepository => {
+            state.status = match open_repository() {
+                Ok(()) => "已在默认浏览器中打开开源项目地址".to_string(),
+                Err(error) => format!("无法打开开源项目地址：{error}"),
+            };
+        }
         Msg::ExecuteDialogResult(result) => {
             let kind = state.execute_dialog.take();
             if result != ZsContentDialogResult::Primary {
@@ -2659,6 +2687,14 @@ fn update(state: &mut AppState, msg: Msg, _cx: &mut AppCx) {
             }
         }
     }
+}
+
+fn open_repository() -> Result<(), String> {
+    Command::new("explorer.exe")
+        .arg(REPOSITORY_URL)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn select_conversation_session(state: &mut AppState, session_id: &str, preserve_analysis: bool) {
@@ -4205,7 +4241,6 @@ mod tests {
             HOME_STORAGE_BUTTON,
             OVERVIEW_OPEN_BUTTON,
             OVERVIEW_ANALYZE_BUTTON,
-            NAV_OVERVIEW_BUTTON,
             NAV_CONVERSATIONS_BUTTON,
             NAV_STORAGE_BUTTON,
             NAV_HISTORY_BUTTON,
@@ -4224,7 +4259,11 @@ mod tests {
         }
 
         let settings = empty_state(Page::Settings);
-        for widget in [SETTINGS_TASK_SCAN_BUTTON, SETTINGS_STORAGE_SCAN_BUTTON] {
+        for widget in [
+            SETTINGS_TASK_SCAN_BUTTON,
+            SETTINGS_STORAGE_SCAN_BUTTON,
+            OPEN_REPOSITORY_BUTTON,
+        ] {
             let _ = click_message(&settings, widget);
         }
     }

@@ -116,6 +116,18 @@ cargo build --release --workspace
 - 同名任务不等于重复任务，同一工作目录也不等于可以一起删除。
 - Codex 的本地格式和官方 App Server 接口可能随版本变化；无法确认的内容默认保留。
 
+## 赞赏支持
+
+如果这个项目对你有帮助，欢迎支持我继续完善 Codex 清理能力。
+
+![赞赏支持](docs/images/donate.png)
+
 ## 许可证
 
 Mozilla Public License 2.0。
+
+## 收藏量趋势图
+
+<a href="https://github.com/qiu7824/CodexCleaner/stargazers">
+  <img src="https://api.star-history.com/svg?repos=qiu7824/CodexCleaner&type=Date" alt="CodexCleaner GitHub 收藏量趋势图" width="760">
+</a>
