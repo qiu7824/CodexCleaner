@@ -74,9 +74,10 @@ const BACK_TO_TASKS_BUTTON: WidgetId = WidgetId::new(447);
 const HOME_TASKS_BUTTON: WidgetId = WidgetId::new(448);
 const HOME_STORAGE_BUTTON: WidgetId = WidgetId::new(449);
 const RESOURCE_DETAIL_DIALOG: WidgetId = WidgetId::new(450);
+const STATUS_INFO_BAR: WidgetId = WidgetId::new(451);
 
 const TASKS_PER_PAGE: usize = 5;
-const RESOURCES_PER_PAGE: usize = 3;
+const RESOURCES_PER_PAGE: usize = 6;
 const STORAGE_ITEMS_PER_PAGE: usize = 5;
 const HISTORY_ITEMS_PER_PAGE: usize = 7;
 
@@ -524,13 +525,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     let icon_path = embedded_icon_path()?;
     let initial_size = if args.iter().any(|value| value == "--smoke-small") {
-        (1060, 760)
+        (1060, 860)
     } else {
         (1360, 860)
     };
     let builder = native_window("Codex Cleaner · 存储与任务清理")
         .size(initial_size.0, initial_size.1)
-        .min_size(1060, 760)
+        .min_size(1060, 860)
         .icon_path(icon_path.to_string_lossy())
         .stateful_view(state, view, update);
 
@@ -644,10 +645,13 @@ fn render_view(state: &AppState) -> ViewNode<Msg> {
         Page::History => view_history(state),
         Page::Settings => view_settings(state),
     };
-    let status = status_bar_text(&state.status)
-        .padding(Dp::new(6.0))
-        .min_height(Dp::new(30.0))
-        .bg(ThemeColorToken::SurfaceRaised);
+    let status = info_bar(
+        STATUS_INFO_BAR,
+        ZsInfoBarSpec::new(&state.status)
+            .title("当前状态")
+            .severity(ZsInfoBarSeverity::Informational)
+            .closable(false),
+    );
     let header = row([
         role_text(state.page.label(), TextRole::WindowTitle).min_width(Dp::new(180.0)),
         status_bar_text(state.page.description()).flex(1.0),
@@ -3984,7 +3988,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 width: 1060,
-                height: 760,
+                height: 860,
             };
             node.layout(&mut ViewLayoutCx::new(bounds, Dpi::new(144.0)));
             assert_eq!(node.bounds(), Some(bounds));

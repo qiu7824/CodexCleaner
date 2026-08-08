@@ -16,6 +16,7 @@ zsui = { version = "=0.2.0-preview.6", path = "../../vendor/zsui", default-featu
     "label",
     "icon",
     "dialog",
+    "info-bar",
     "scroll",
     "virtual-list",
     "table",
