@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "cleaner-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "regex",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "codex-cleaner"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "cleaner-core",

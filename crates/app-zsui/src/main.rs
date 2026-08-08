@@ -22,7 +22,7 @@ use cleaner_core::{
 };
 use zsui::*;
 
-use windows_startup::{set_app_identity, splash_title, StartupSplash};
+use windows_startup::set_app_identity;
 
 const SESSION_TABLE: WidgetId = WidgetId::new(100);
 const RESOURCE_TABLE: WidgetId = WidgetId::new(200);
@@ -73,11 +73,12 @@ const CONTENT_SCROLL: WidgetId = WidgetId::new(446);
 const BACK_TO_TASKS_BUTTON: WidgetId = WidgetId::new(447);
 const HOME_TASKS_BUTTON: WidgetId = WidgetId::new(448);
 const HOME_STORAGE_BUTTON: WidgetId = WidgetId::new(449);
+const RESOURCE_DETAIL_DIALOG: WidgetId = WidgetId::new(450);
 
 const TASKS_PER_PAGE: usize = 5;
-const RESOURCES_PER_PAGE: usize = 5;
-const STORAGE_ITEMS_PER_PAGE: usize = 8;
-const HISTORY_ITEMS_PER_PAGE: usize = 9;
+const RESOURCES_PER_PAGE: usize = 3;
+const STORAGE_ITEMS_PER_PAGE: usize = 5;
+const HISTORY_ITEMS_PER_PAGE: usize = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -163,11 +164,11 @@ enum ResourceFilter {
 impl ResourceFilter {
     const fn label(self) -> &'static str {
         match self {
-            Self::Cleanup => "清理",
-            Self::Keep => "保留",
-            Self::Decide => "待决定",
-            Self::Storage => "共享/全局",
-            Self::All => "全部",
+            Self::Cleanup => "已选清理",
+            Self::Keep => "已选保留",
+            Self::Decide => "需要决定",
+            Self::Storage => "不可在此清理",
+            Self::All => "全部资源",
         }
     }
 }
@@ -258,11 +259,11 @@ struct FullScanResult {
 impl StorageFilter {
     const fn label(self) -> &'static str {
         match self {
-            Self::Recommended => "推荐安全清理",
-            Self::Review => "需要核对",
+            Self::Recommended => "推荐清理",
+            Self::Review => "人工判断",
             Self::Protected => "受保护",
-            Self::Selected => "已选择",
-            Self::All => "全部项目",
+            Self::Selected => "已选清理",
+            Self::All => "全部",
         }
     }
 }
@@ -277,6 +278,7 @@ enum Msg {
     RefreshSessions,
     TaskFilterSelected(TaskFilter),
     SessionSelected(ZsTableRowId),
+    SessionInvoked(ZsTableRowId),
     SessionSorted(ZsTableSort),
     TaskPreviousPage,
     TaskNextPage,
@@ -284,6 +286,8 @@ enum Msg {
     ResourceFilterSelected(ResourceFilter),
     ResourcePreviousPage,
     ResourceNextPage,
+    ShowResourceDetail,
+    ResourceDetailClosed(ZsContentDialogResult),
     AnalyzeSelected,
     BackToTaskSelection,
     ResultsOnly,
@@ -293,7 +297,6 @@ enum Msg {
     KeepSelected,
     DeleteSelected,
     ReviewSelected,
-    CleanOperationIntermediates,
     Preview,
     ExecuteRequested,
     StorageRefresh,
@@ -341,6 +344,7 @@ struct AppState {
     status: String,
     codex_binary: Option<PathBuf>,
     execute_dialog: Option<ExecuteKind>,
+    show_resource_detail: bool,
     background: Arc<Mutex<BackgroundState>>,
 }
 
@@ -355,33 +359,9 @@ fn main() {
 fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     set_app_identity();
-    if let Some(progress_file) = argument_value(&args, "--startup-splash") {
-        return run_startup_splash(PathBuf::from(progress_file));
-    }
-    let command_mode = args.iter().any(|value| {
-        matches!(
-            value.as_str(),
-            "--probe-official"
-                | "--probe-thread"
-                | "--scan-json"
-                | "--storage-json"
-                | "--analyze"
-                | "--smoke"
-        )
-    });
-    let splash = (!command_mode).then(StartupSplash::launch).flatten();
-    if let Some(splash) = splash.as_ref() {
-        splash.update(10, "定位 Codex 数据目录");
-    }
+    let smoke_mode = args.iter().any(|value| value == "--smoke");
     let explicit_home = argument_value(&args, "--codex-home").map(PathBuf::from);
     let home = discover_codex_home(explicit_home);
-    if let Some(splash) = splash.as_ref() {
-        splash.update(25, "读取任务索引与本地记录");
-    }
-    let mut report = scan_codex_home(&home)?;
-    if let Some(splash) = splash.as_ref() {
-        splash.update(50, "核对任务名称和归档状态");
-    }
     let explicit_binary = argument_value(&args, "--codex-bin").map(PathBuf::from);
     let codex_binary = discover_codex_binary(&home, explicit_binary);
 
@@ -409,13 +389,24 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if !args.iter().any(|value| value == "--smoke") {
+    let needs_report = smoke_mode
+        || args.iter().any(|value| value == "--scan-json")
+        || argument_value(&args, "--analyze").is_some();
+    let mut report = if needs_report {
+        scan_codex_home(&home)?
+    } else {
+        ScanReport {
+            codex_home: home.clone(),
+            sessions: Vec::new(),
+            transcript_bytes: 0,
+            malformed_index_lines: 0,
+            warnings: Vec::new(),
+        }
+    };
+    if needs_report && !smoke_mode {
         if let Some(binary) = codex_binary.as_ref() {
             let _ = enrich_session_titles_official(&mut report, binary, Duration::from_secs(12));
         }
-    }
-    if let Some(splash) = splash.as_ref() {
-        splash.update(70, "分析重复任务与项目关联");
     }
     if args.iter().any(|value| value == "--scan-json") {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -426,7 +417,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", serde_json::to_string_pretty(&analysis)?);
         return Ok(());
     }
-    let smoke_mode = args.iter().any(|value| value == "--smoke");
     let storage_json = args.iter().any(|value| value == "--storage-json");
     let storage = if smoke_mode || storage_json {
         scan_codex_storage(&home)
@@ -442,10 +432,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", serde_json::to_string_pretty(&storage)?);
         return Ok(());
     }
-    if let Some(splash) = splash.as_ref() {
-        splash.update(92, "准备任务清理主界面");
-    }
-
     if let Some(smoke_session_id) = argument_value(&args, "--smoke-session") {
         if let Some(index) = report
             .sessions
@@ -520,6 +506,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         analysis: None,
         codex_binary,
         execute_dialog: None,
+        show_resource_detail: false,
         background: Arc::new(Mutex::new(BackgroundState::default())),
     };
     if args.iter().any(|value| value == "--smoke-analyzed") {
@@ -531,12 +518,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             });
         apply_background_result(&mut state, BackgroundResult::Analysis(analysis));
     }
-    if let Some(splash) = splash.as_ref() {
-        splash.complete("扫描完成，正在打开主界面");
-    }
-    drop(splash);
     if !smoke_mode {
-        start_storage_refresh(&mut state);
+        start_full_scan(&mut state);
     }
 
     let icon_path = embedded_icon_path()?;
@@ -580,61 +563,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     builder.run()?;
     Ok(())
-}
-
-fn run_startup_splash(progress_file: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let icon = embedded_icon_path()?;
-    let view_progress_file = progress_file.clone();
-    native_window(splash_title())
-        .size(560, 210)
-        .min_size(560, 210)
-        .resizable(false)
-        .always_on_top(true)
-        .icon_path(icon.to_string_lossy())
-        .stateful_view(
-            (),
-            move |_| startup_splash_view(&view_progress_file),
-            |_, _, _| {},
-        )
-        .run()?;
-    Ok(())
-}
-
-fn startup_splash_view(progress_file: &std::path::Path) -> ViewNode<()> {
-    let (percent, stage) = read_startup_progress(progress_file);
-    let repaint_pump = virtual_list(1, [(0, ())], |_, _| spacer())
-        .loading(percent < 100)
-        .placeholders(false)
-        .height(Dp::new(1.0));
-    column([
-        text("Codex Cleaner"),
-        text(format!("正在扫描：{stage}")),
-        row([
-            progress_ring(ZsProgressRingSpec::indeterminate()),
-            progress_bar(percent as f32, ProgressRange::new(0.0, 100.0)).flex(1.0),
-            text(format!("{percent}%")),
-        ])
-        .height(Dp::new(42.0))
-        .gap(Dp::new(12.0)),
-        text("扫描只读取文件结构和任务元数据，不会自动删除内容。"),
-        repaint_pump,
-    ])
-    .gap(Dp::new(10.0))
-    .padding(Dp::new(20.0))
-    .bg(ThemeColorToken::Surface)
-    .theme_mode(ZsuiThemeMode::Light)
-}
-
-fn read_startup_progress(progress_file: &std::path::Path) -> (u8, String) {
-    let content = fs::read_to_string(progress_file).unwrap_or_default();
-    let mut lines = content.lines();
-    let percent = lines
-        .next()
-        .and_then(|value| value.parse::<u8>().ok())
-        .unwrap_or(0)
-        .min(100);
-    let stage = lines.next().unwrap_or("准备扫描").to_string();
-    (percent, stage)
 }
 
 fn embedded_icon_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -699,6 +627,15 @@ fn status_text(value: impl Into<String>) -> ViewNode<Msg> {
     styled_text(value, style)
 }
 
+fn status_bar_text(value: impl Into<String>) -> ViewNode<Msg> {
+    let mut style = SemanticTextStyle::for_role(TextRole::Caption);
+    style.color = ColorRole::SecondaryText;
+    style.vertical_align = VerticalAlign::Center;
+    style.wrap = TextWrap::NoWrap;
+    style.ellipsis = true;
+    styled_text(value, style)
+}
+
 fn render_view(state: &AppState) -> ViewNode<Msg> {
     let body = match state.page {
         Page::Overview => view_overview(state),
@@ -707,22 +644,21 @@ fn render_view(state: &AppState) -> ViewNode<Msg> {
         Page::History => view_history(state),
         Page::Settings => view_settings(state),
     };
-    let status = status_text(&state.status)
-        .padding(Dp::new(8.0))
-        .min_height(Dp::new(36.0))
+    let status = status_bar_text(&state.status)
+        .padding(Dp::new(6.0))
+        .min_height(Dp::new(30.0))
         .bg(ThemeColorToken::SurfaceRaised);
-    let content = column([
-        role_text(state.page.label(), TextRole::WindowTitle),
-        secondary_text(state.page.description(), TextRole::Body),
-        background_activity(state),
-        status,
-        body,
+    let header = row([
+        role_text(state.page.label(), TextRole::WindowTitle).min_width(Dp::new(180.0)),
+        status_bar_text(state.page.description()).flex(1.0),
     ])
-    .id(CONTENT_SCROLL)
-    .flex(1.0)
-    .gap(Dp::new(12.0))
-    .padding(Dp::new(22.0))
-    .auto_scroll_y();
+    .min_height(Dp::new(38.0))
+    .gap(Dp::new(16.0));
+    let content = column([header, status, body, background_activity(state)])
+        .id(CONTENT_SCROLL)
+        .flex(1.0)
+        .gap(Dp::new(8.0))
+        .padding(Dp::new(16.0));
     let navigation_items = [
         (Page::Overview, NAV_OVERVIEW_BUTTON),
         (Page::Conversations, NAV_CONVERSATIONS_BUTTON),
@@ -752,7 +688,7 @@ fn render_view(state: &AppState) -> ViewNode<Msg> {
                 .gap(Dp::new(8.0)),
             )
             .pane_width(Dp::new(220.0))
-            .minimum_content_width(Dp::new(920.0))
+            .minimum_content_width(Dp::new(800.0))
             .content(NAVIGATION_VIEW, content),
     )
     .bg(ThemeColorToken::Surface)
@@ -761,6 +697,19 @@ fn render_view(state: &AppState) -> ViewNode<Msg> {
     } else {
         ZsuiThemeMode::Light
     });
+
+    if state.show_resource_detail {
+        let detail = selected_resource(state)
+            .map(resource_detail_text)
+            .unwrap_or_else(|| "所选资源已经不在当前分析结果中。".to_string());
+        return content_dialog(
+            RESOURCE_DETAIL_DIALOG,
+            true,
+            ZsContentDialogSpec::new(detail, "关闭").title("完整判断依据"),
+            page,
+        )
+        .on_dialog_result(Msg::ResourceDetailClosed);
+    }
 
     let Some(kind) = state.execute_dialog else {
         return page;
@@ -841,34 +790,10 @@ fn background_activity(state: &AppState) -> ViewNode<Msg> {
         .lock()
         .map(|value| value.clone())
         .unwrap_or_default();
-    let pump = virtual_list(1, [(0, ())], |_, _| spacer())
+    virtual_list(1, [(0, ())], |_, _| spacer())
         .loading(background.running)
         .placeholders(false)
-        .height(Dp::new(1.0));
-    if !background.running {
-        return pump;
-    }
-    column([
-        row([
-            progress_ring(ZsProgressRingSpec::indeterminate()),
-            status_text(format!(
-                "{}：{}",
-                background
-                    .kind
-                    .map(BackgroundKind::label)
-                    .unwrap_or("处理中"),
-                background.stage
-            )),
-            progress_bar(background.percent as f32, ProgressRange::new(0.0, 100.0)).flex(1.0),
-            text(format!("{}%", background.percent)),
-        ])
-        .min_height(Dp::new(34.0))
-        .gap(Dp::new(10.0)),
-        pump,
-    ])
-    .padding(Dp::new(6.0))
-    .bg(ThemeColorToken::SurfaceRaised)
-    .gap(Dp::new(2.0))
+        .height(Dp::new(1.0))
 }
 
 fn apply_background_preview(state: &mut AppState) {
@@ -879,11 +804,12 @@ fn apply_background_preview(state: &mut AppState) {
         .unwrap_or_default();
     if background.running {
         state.status = format!(
-            "{}：{}",
+            "正在{} · {}% · {}",
             background
                 .kind
                 .map(BackgroundKind::label)
                 .unwrap_or("处理中"),
+            background.percent,
             background.stage
         );
     }
@@ -988,10 +914,10 @@ fn apply_background_result(state: &mut AppState, result: BackgroundResult) {
             state.status = format!("已读取 {} 条清理执行记录", state.history.len());
         }
         BackgroundResult::Analysis(Ok(analysis)) => {
-            let selected_resource = analysis
+            let decision_resource = analysis
                 .resources
                 .iter()
-                .find(|resource| resource.action == ResourceAction::Delete)
+                .find(|resource| resource.action == ResourceAction::Review)
                 .map(|resource| ZsTableRowId::new(resource.id));
             let final_count = analysis
                 .resources
@@ -1004,15 +930,19 @@ fn apply_background_result(state: &mut AppState, result: BackgroundResult) {
                 .filter(|resource| resource.artifact_stage == Some(ArtifactStage::Intermediate))
                 .count();
             state.status = format!(
-                "分析完成：{} 项资源，最终成果 {}，过程成果 {}，关联子任务 {}",
+                "分析完成：{} 项资源，最终成果 {}，过程成果 {}，关联子任务 {}；已打开需要决定的项目",
                 analysis.resources.len(),
                 final_count,
                 intermediate_count,
                 analysis.related_session_ids.len()
             );
             state.analysis = Some(analysis);
-            state.selected_resource = selected_resource;
-            state.resource_filter = ResourceFilter::All;
+            state.selected_resource = decision_resource;
+            state.resource_filter = if state.selected_resource.is_some() {
+                ResourceFilter::Decide
+            } else {
+                ResourceFilter::All
+            };
             state.resource_page = 0;
         }
         BackgroundResult::Analysis(Err(error)) => {
@@ -1165,17 +1095,14 @@ fn view_overview(state: &AppState) -> ViewNode<Msg> {
         ),
         summary_card("需要核对", format_bytes(review_bytes)),
     ])
-    .min_height(Dp::new(72.0))
+    .min_height(Dp::new(58.0))
     .gap(Dp::new(10.0));
 
     let quick_actions = row([
         section(
             "清理一个任务",
             [
-                secondary_text(
-                    "选择一个 Codex 任务，先确认成果和源码，再决定清理内容。",
-                    TextRole::Body,
-                ),
+                secondary_text("选择任务，确认要保留的成果和源码。", TextRole::Body),
                 primary_button("选择任务")
                     .id(HOME_TASKS_BUTTON)
                     .on_click(Msg::Navigate(Page::Conversations)),
@@ -1185,10 +1112,7 @@ fn view_overview(state: &AppState) -> ViewNode<Msg> {
         section(
             "释放磁盘空间",
             [
-                secondary_text(
-                    "查看缓存、临时文件、备份和更新残留，并按安全等级处理。",
-                    TextRole::Body,
-                ),
+                secondary_text("安全处理缓存、临时文件、备份和更新残留。", TextRole::Body),
                 primary_button("查看可释放空间")
                     .id(HOME_STORAGE_BUTTON)
                     .on_click(Msg::Navigate(Page::Storage)),
@@ -1196,13 +1120,13 @@ fn view_overview(state: &AppState) -> ViewNode<Msg> {
         )
         .flex(1.0),
     ])
-    .min_height(Dp::new(118.0))
+    .min_height(Dp::new(92.0))
     .gap(Dp::new(10.0));
 
     let recommendation_indices = overview_session_indices(&state.report);
     let rows = recommendation_indices
         .iter()
-        .take(5)
+        .take(3)
         .map(|index| {
             let session = &state.report.sessions[*index];
             let stats = task_tree_stats(&state.report, &session.id);
@@ -1245,46 +1169,25 @@ fn view_overview(state: &AppState) -> ViewNode<Msg> {
         rows,
     )
     .id(OVERVIEW_TABLE)
-    .height(table_viewport_height(5))
+    .height(table_viewport_height(3))
     .selected_table_row(overview_row)
     .on_table_select(Msg::OverviewSelected);
-    let recommendation_panel = section(
-        "建议分析的任务",
-        [
-            grid,
-            secondary_text(
-                if recommendation_indices.is_empty() {
-                    "暂无符合建议条件的旧任务；可进入“任务清理”查看全部任务。"
-                } else {
-                    "选择一行后，可在下方直接分析或查看全部任务。"
-                },
-                TextRole::Caption,
-            ),
-        ],
-    );
-
-    let selected_panel = if let Some(session) = overview_selected_session(state) {
+    let selected_action = if let Some(session) = overview_selected_session(state) {
         let stats = task_tree_stats(&state.report, &session.id);
         let reasons = task_recommendation_reasons(&state.report, session).join("、");
         let analyzed = state
             .analysis
             .as_ref()
             .is_some_and(|analysis| analysis.session.id == session.id);
-        section(
-            "已选择任务",
-            [
-                body_strong(session.title.clone()),
-                secondary_text(
-                    format!(
-                        "{} · {} · {} 个子任务 · {}",
-                        session.status.label(),
-                        format_bytes(stats.transcript_bytes),
-                        stats.descendant_count,
-                        task_project_name(session)
-                    ),
-                    TextRole::Body,
-                ),
-                secondary_text(format!("建议原因：{reasons}"), TextRole::Body),
+        column([
+            row([
+                status_bar_text(format!(
+                    "已选：{} · {} · {} 个子任务",
+                    ellipsize(&session.title, 22),
+                    format_bytes(stats.transcript_bytes),
+                    stats.descendant_count
+                ))
+                .flex(1.0),
                 row([
                     button("查看全部任务")
                         .id(OVERVIEW_OPEN_BUTTON)
@@ -1299,19 +1202,22 @@ fn view_overview(state: &AppState) -> ViewNode<Msg> {
                 ])
                 .min_height(Dp::new(36.0))
                 .gap(Dp::new(8.0)),
-            ],
-        )
+            ])
+            .gap(Dp::new(8.0)),
+            status_bar_text(format!("建议原因：{}", ellipsize(&reasons, 36))),
+        ])
+        .min_height(Dp::new(60.0))
+        .gap(Dp::new(4.0))
     } else {
-        section(
-            "选择任务",
-            [
-                secondary_text("从建议列表选择一行，或直接查看全部任务。", TextRole::Body),
-                primary_button("查看全部任务")
-                    .id(OVERVIEW_OPEN_BUTTON)
-                    .on_click(Msg::OverviewOpenSelected),
-            ],
-        )
+        row([
+            secondary_text("暂无建议项，可查看全部任务。", TextRole::Body).flex(1.0),
+            primary_button("查看全部任务")
+                .id(OVERVIEW_OPEN_BUTTON)
+                .on_click(Msg::OverviewOpenSelected),
+        ])
+        .min_height(Dp::new(40.0))
     };
+    let recommendation_panel = section("建议分析的任务", [grid, selected_action]);
 
     column([
         scan_action,
@@ -1319,7 +1225,6 @@ fn view_overview(state: &AppState) -> ViewNode<Msg> {
         drive_section,
         metrics,
         recommendation_panel,
-        selected_panel,
     ])
     .flex(1.0)
     .gap(Dp::new(10.0))
@@ -1442,7 +1347,8 @@ fn view_storage(state: &AppState) -> ViewNode<Msg> {
     ])
     .min_height(Dp::new(34.0))
     .gap(Dp::new(8.0));
-    let detail = selected_storage(state)
+    let selected = selected_storage(state);
+    let detail = selected
         .map(|item| {
             let newest = item
                 .newest_at
@@ -1464,10 +1370,17 @@ fn view_storage(state: &AppState) -> ViewNode<Msg> {
             )
         })
         .unwrap_or_else(|| "选择一项可查看为何能清理或为何受保护。".to_string());
+    let can_clean = selected.is_some_and(|item| item.safety != StorageSafety::Protected);
     let selected_actions = row([
-        button("保留所选").on_click(Msg::StorageKeepSelected),
-        button("清理所选").on_click(Msg::StorageCleanSelected),
-        button("恢复为需核对").on_click(Msg::StorageReviewSelected),
+        primary_button("保留这个项目")
+            .enabled(selected.is_some())
+            .on_click(Msg::StorageKeepSelected),
+        button("清理这个项目")
+            .enabled(selected.is_some() && can_clean)
+            .on_click(Msg::StorageCleanSelected),
+        button("稍后决定")
+            .enabled(selected.is_some())
+            .on_click(Msg::StorageReviewSelected),
         spacer().flex(1.0),
         status_text(format!(
             "已选 {} 项，共 {}",
@@ -1483,7 +1396,7 @@ fn view_storage(state: &AppState) -> ViewNode<Msg> {
     ])
     .gap(Dp::new(8.0));
     let execute_actions = row([
-        body_strong("3  核对并执行"),
+        body_strong("3  核对并执行").min_width(Dp::new(130.0)),
         spacer().flex(1.0),
         button("导出清理清单")
             .id(STORAGE_PREVIEW_BUTTON)
@@ -1505,8 +1418,12 @@ fn view_storage(state: &AppState) -> ViewNode<Msg> {
         filters,
         grid,
         pager,
-        body_strong("2  核对所选项目"),
-        secondary_text(detail, TextRole::Body).min_height(Dp::new(96.0)),
+        body_strong(if selected.is_some() {
+            "2  当前项目：请选择保留或清理"
+        } else {
+            "2  选择表格中的一个项目"
+        }),
+        secondary_text(detail, TextRole::Body).min_height(Dp::new(66.0)),
         selected_actions,
         execute_actions,
     ])
@@ -1699,16 +1616,11 @@ fn view_settings(state: &AppState) -> ViewNode<Msg> {
             body_text("✓ 安全缓存规则要求至少 7 天未活动"),
         ],
     );
-    let about = section(
-        "关于",
-        [secondary_text(
-            format!(
-                "Codex Cleaner {} · Rust · ZSUI 0.2.0-preview.6（本地源码）",
-                env!("CARGO_PKG_VERSION")
-            ),
-            TextRole::Body,
-        )],
-    );
+    let about = status_bar_text(format!(
+        "Codex Cleaner {} · Rust · ZSUI 0.2.0-preview.6（本地源码）",
+        env!("CARGO_PKG_VERSION")
+    ))
+    .min_height(Dp::new(24.0));
     column([appearance, scanning, locations, safety, about])
         .flex(1.0)
         .gap(Dp::new(10.0))
@@ -1756,6 +1668,7 @@ fn view_conversations(state: &AppState) -> ViewNode<Msg> {
     .selected_table_row(state.selected_session)
     .table_sort(state.session_sort)
     .on_table_select(Msg::SessionSelected)
+    .on_table_invoke(Msg::SessionInvoked)
     .on_table_sort(Msg::SessionSorted);
     let filter_button = |filter: TaskFilter, id: WidgetId| {
         let marker = if state.task_filter == filter {
@@ -1829,7 +1742,7 @@ fn view_conversations(state: &AppState) -> ViewNode<Msg> {
             state.report.sessions.len()
         )),
         secondary_text(
-            "先选任务，再点击页面下方的“分析所选任务”；分析前不会出现清理按钮。",
+            "选择一行后点击“分析所选任务”，也可以直接双击任务；分析前不会出现清理按钮。",
             TextRole::Caption,
         ),
         filters,
@@ -1877,32 +1790,24 @@ fn analyzed_task_view(state: &AppState) -> ViewNode<Msg> {
             .filter(|resource| resource.artifact_stage == Some(stage))
             .count()
     };
-    let strategy = column([
-        row([
-            button(profile_label(state, RetentionProfile::ResultsOnly))
-                .id(RESULTS_ONLY_BUTTON)
-                .on_click(Msg::ResultsOnly),
-            button(profile_label(state, RetentionProfile::ResultsAndSource))
-                .id(RESULTS_SOURCE_BUTTON)
-                .on_click(Msg::ResultsAndSource),
-        ])
-        .min_height(Dp::new(34.0))
-        .gap(Dp::new(6.0)),
-        row([
-            button(profile_label(
-                state,
-                RetentionProfile::DevelopmentEnvironment,
-            ))
-            .id(DEVELOPMENT_BUTTON)
-            .on_click(Msg::DevelopmentEnvironment),
-            button(profile_label(state, RetentionProfile::ConversationOnly))
-                .id(CONVERSATION_ONLY_BUTTON)
-                .on_click(Msg::ConversationOnly),
-        ])
-        .min_height(Dp::new(34.0))
-        .gap(Dp::new(6.0)),
+    let strategy = row([
+        button(profile_label(state, RetentionProfile::ResultsOnly))
+            .id(RESULTS_ONLY_BUTTON)
+            .on_click(Msg::ResultsOnly),
+        button(profile_label(state, RetentionProfile::ResultsAndSource))
+            .id(RESULTS_SOURCE_BUTTON)
+            .on_click(Msg::ResultsAndSource),
+        button(profile_label(
+            state,
+            RetentionProfile::DevelopmentEnvironment,
+        ))
+        .id(DEVELOPMENT_BUTTON)
+        .on_click(Msg::DevelopmentEnvironment),
+        button(profile_label(state, RetentionProfile::ConversationOnly))
+            .id(CONVERSATION_ONLY_BUTTON)
+            .on_click(Msg::ConversationOnly),
     ])
-    .min_height(Dp::new(74.0))
+    .min_height(Dp::new(34.0))
     .gap(Dp::new(6.0));
     let cards = row([
         summary_card(
@@ -1918,9 +1823,19 @@ fn analyzed_task_view(state: &AppState) -> ViewNode<Msg> {
                 stages(ArtifactStage::Intermediate)
             ),
         ),
-        summary_card("待决定", format!("{} 项", analysis.review_count())),
+        summary_card(
+            "需要决定",
+            format!(
+                "{} 项",
+                analysis
+                    .resources
+                    .iter()
+                    .filter(|resource| resource.action == ResourceAction::Review)
+                    .count()
+            ),
+        ),
     ])
-    .min_height(Dp::new(62.0))
+    .min_height(Dp::new(50.0))
     .gap(Dp::new(6.0));
     let warning = if analysis.truncated {
         "分析达到读取上限：未确认项目已默认保留或列入“需要决定”。".to_string()
@@ -2027,39 +1942,74 @@ fn analyzed_task_view(state: &AppState) -> ViewNode<Msg> {
     ])
     .min_height(Dp::new(34.0))
     .gap(Dp::new(8.0));
-    let detail = selected_resource(state)
-        .map(resource_detail_text)
-        .unwrap_or_else(|| "选择一项可查看完整路径、判断证据和成果阶段。".to_string());
-    column([
-        body_strong("2  选择保留方案"),
-        status_text(format!(
-            "已识别 {} 项 · 当前筛选 {} 项",
-            analysis.resources.len(),
-            visible.len()
-        )),
-        strategy,
-        cards,
-        secondary_text(wrap_all_for_display(&warning, 72), TextRole::Body)
-            .min_height(Dp::new(28.0)),
-        filters,
-        grid,
-        pager,
-        secondary_text(detail, TextRole::Body).min_height(Dp::new(110.0)),
+    let selected = selected_resource(state);
+    let detail = selected
+        .map(resource_decision_text)
+        .unwrap_or_else(|| "请选择表格中的一个项目。".to_string());
+    let can_delete = selected.is_some_and(|resource| {
+        matches!(
+            resource.ownership,
+            cleaner_core::Ownership::Exclusive | cleaner_core::Ownership::Unknown
+        ) || matches!(
+            resource.kind,
+            ResourceKind::Conversation | ResourceKind::StateReference
+        )
+    });
+    let decision_title = selected.map_or("当前未选择项目", |resource| {
+        if matches!(
+            resource.action,
+            ResourceAction::Review | ResourceAction::Protected | ResourceAction::StorageReview
+        ) {
+            "当前项目需要你决定"
+        } else {
+            "当前项目的处理方式"
+        }
+    });
+    let decision = column([
+        body_strong(decision_title),
+        secondary_text(detail, TextRole::Body).min_height(Dp::new(48.0)),
         row([
-            button("保留所选").on_click(Msg::KeepSelected),
-            button("清理所选").on_click(Msg::DeleteSelected),
-            button("设为待决定").on_click(Msg::ReviewSelected),
-            button("选择专属过程成果").on_click(Msg::CleanOperationIntermediates),
+            primary_button("保留这个项目")
+                .enabled(selected.is_some())
+                .on_click(Msg::KeepSelected),
+            button("清理这个项目")
+                .enabled(selected.is_some() && can_delete)
+                .on_click(Msg::DeleteSelected),
+            button("稍后决定")
+                .enabled(selected.is_some())
+                .on_click(Msg::ReviewSelected),
+            button("查看完整判断")
+                .enabled(selected.is_some())
+                .on_click(Msg::ShowResourceDetail),
         ])
         .min_height(Dp::new(34.0))
         .gap(Dp::new(6.0)),
+    ])
+    .gap(Dp::new(4.0));
+    column([
         row([
-            body_strong("3  核对并执行"),
+            body_strong("2  选择保留方案").min_width(Dp::new(180.0)),
+            spacer().flex(1.0),
+            status_bar_text(format!(
+                "共 {} 项 · 当前列表 {} 项",
+                analysis.resources.len(),
+                visible.len()
+            )),
+        ]),
+        strategy,
+        cards,
+        status_bar_text(warning).min_height(Dp::new(24.0)),
+        filters,
+        grid,
+        pager,
+        decision,
+        row([
+            body_strong("3  核对并执行").min_width(Dp::new(130.0)),
             spacer().flex(1.0),
             button("导出清理清单")
                 .id(PREVIEW_BUTTON)
                 .on_click(Msg::Preview),
-            button("核对永久删除")
+            primary_button("核对永久删除")
                 .id(EXECUTE_BUTTON)
                 .on_click(Msg::ExecuteRequested),
         ])
@@ -2103,6 +2053,23 @@ fn resource_detail_text(resource: &cleaner_core::ResourceNode) -> String {
     )
 }
 
+fn resource_decision_text(resource: &cleaner_core::ResourceNode) -> String {
+    let evidence = resource
+        .evidence
+        .first()
+        .map(|value| format!("{}：{}", value.source, value.detail))
+        .unwrap_or_else(|| "没有附加证据".to_string());
+    format!(
+        "{}\n{} · {} · {} · 当前：{}\n主要判断：{}",
+        wrap_all_for_display(&resource.location.display().to_string(), 96),
+        resource.kind.label(),
+        resource.ownership.label(),
+        format_bytes(resource.size),
+        resource.action.label(),
+        ellipsize(&evidence, 180)
+    )
+}
+
 fn visible_resources(state: &AppState) -> Vec<&cleaner_core::ResourceNode> {
     let Some(analysis) = state.analysis.as_ref() else {
         return Vec::new();
@@ -2118,11 +2085,11 @@ fn resource_matches_filter(resource: &cleaner_core::ResourceNode, filter: Resour
     match filter {
         ResourceFilter::Cleanup => resource.action == ResourceAction::Delete,
         ResourceFilter::Keep => resource.action == ResourceAction::Keep,
-        ResourceFilter::Decide => matches!(
+        ResourceFilter::Decide => resource.action == ResourceAction::Review,
+        ResourceFilter::Storage => matches!(
             resource.action,
-            ResourceAction::Review | ResourceAction::Protected
+            ResourceAction::StorageReview | ResourceAction::Protected
         ),
-        ResourceFilter::Storage => resource.action == ResourceAction::StorageReview,
         ResourceFilter::All => true,
     }
 }
@@ -2480,6 +2447,13 @@ fn update(state: &mut AppState, msg: Msg, _cx: &mut AppCx) {
                 state.status = format!("已选择：{}", session.title);
             }
         }
+        Msg::SessionInvoked(row) => {
+            state.selected_session = Some(row);
+            state.selected_resource = None;
+            state.resource_page = 0;
+            state.analysis = None;
+            start_analyze_selected(state);
+        }
         Msg::SessionSorted(sort) => {
             state.session_sort = Some(sort);
             sort_sessions(&mut state.report, sort);
@@ -2543,6 +2517,19 @@ fn update(state: &mut AppState, msg: Msg, _cx: &mut AppCx) {
                 .get(state.resource_page.saturating_mul(RESOURCES_PER_PAGE))
                 .map(|resource| ZsTableRowId::new(resource.id));
         }
+        Msg::ShowResourceDetail => {
+            if state.selected_resource.is_some() {
+                state.show_resource_detail = true;
+            } else {
+                state.status = "请先选择一个资源".to_string();
+            }
+        }
+        Msg::ResourceDetailClosed(result) => {
+            state.show_resource_detail = false;
+            if result == ZsContentDialogResult::Close {
+                state.status = "已关闭完整判断依据".to_string();
+            }
+        }
         Msg::AnalyzeSelected => start_analyze_selected(state),
         Msg::BackToTaskSelection => {
             state.analysis = None;
@@ -2559,7 +2546,6 @@ fn update(state: &mut AppState, msg: Msg, _cx: &mut AppCx) {
         Msg::KeepSelected => set_selected_action(state, ResourceAction::Keep),
         Msg::DeleteSelected => set_selected_action(state, ResourceAction::Delete),
         Msg::ReviewSelected => set_selected_action(state, ResourceAction::Review),
-        Msg::CleanOperationIntermediates => clean_operation_intermediates(state),
         Msg::Preview => match state.analysis.as_ref() {
             Some(analysis) => match write_preview(analysis) {
                 Ok(path) => state.status = format!("任务清理预览已保存：{}", path.display()),
@@ -3085,38 +3071,21 @@ fn set_selected_action(state: &mut AppState, action: ResourceAction) {
     } else {
         format!("所选关联资源已标记：{}", action.label())
     };
-}
-
-fn clean_operation_intermediates(state: &mut AppState) {
-    let Some(analysis) = state.analysis.as_mut() else {
-        state.status = "请先分析任务".to_string();
-        return;
-    };
-    let mut count = 0_usize;
-    let mut bytes = 0_u64;
-    for resource in &mut analysis.resources {
-        let operation_path = resource
-            .location
-            .path()
-            .is_some_and(|path| path.to_string_lossy().contains("codex操作目录"));
-        if operation_path
-            && resource.artifact_stage == Some(ArtifactStage::Intermediate)
-            && resource.ownership == cleaner_core::Ownership::Exclusive
-        {
-            resource.user_override = Some(ResourceAction::Delete);
-            resource.action = ResourceAction::Delete;
-            count = count.saturating_add(1);
-            bytes = bytes.saturating_add(resource.size);
+    if state.resource_filter == ResourceFilter::Decide && action != ResourceAction::Review {
+        state.resource_page = 0;
+        state.selected_resource = state.analysis.as_ref().and_then(|analysis| {
+            analysis
+                .resources
+                .iter()
+                .find(|resource| resource.action == ResourceAction::Review)
+                .map(|resource| ZsTableRowId::new(resource.id))
+        });
+        if state.selected_resource.is_none() {
+            state.status.push_str("；需要决定的项目已全部处理");
+        } else {
+            state.status.push_str("；已自动选中下一项");
         }
     }
-    state.resource_filter = ResourceFilter::All;
-    state.resource_page = 0;
-    state.selected_resource = None;
-    state.status = format!(
-        "已选择 {} 个确认由任务生成的过程成果，共 {}；归属不明项仍需逐项决定",
-        count,
-        format_bytes(bytes)
-    );
 }
 
 fn set_selected_storage_action(state: &mut AppState, action: StorageAction) {
@@ -3504,14 +3473,41 @@ fn apply_profile(state: &mut AppState, profile: RetentionProfile) {
         state.status = "请先分析任务，再选择保留方案".to_string();
         return;
     }
-    if let Some(analysis) = state.analysis.as_mut() {
+    let summary = if let Some(analysis) = state.analysis.as_mut() {
         apply_retention_profile(analysis, profile);
+        let decision_count = analysis
+            .resources
+            .iter()
+            .filter(|resource| resource.action == ResourceAction::Review)
+            .count();
+        Some((
+            analysis.delete_bytes(),
+            analysis.keep_bytes(),
+            decision_count,
+        ))
+    } else {
+        None
+    };
+    if let Some((delete_bytes, keep_bytes, decision_count)) = summary {
+        state.resource_filter = if decision_count > 0 {
+            ResourceFilter::Decide
+        } else {
+            ResourceFilter::All
+        };
+        state.resource_page = 0;
+        state.selected_resource = visible_resources(state)
+            .first()
+            .map(|resource| ZsTableRowId::new(resource.id));
         state.status = format!(
-            "已应用：{}；当前待清理 {}，保留 {}，需确认 {} 项",
+            "已应用“{}”：清理 {}，保留 {}；{}",
             profile.label(),
-            format_bytes(analysis.delete_bytes()),
-            format_bytes(analysis.keep_bytes()),
-            analysis.review_count()
+            format_bytes(delete_bytes),
+            format_bytes(keep_bytes),
+            if decision_count > 0 {
+                format!("已自动列出 {decision_count} 个需要你决定的项目")
+            } else {
+                "没有需要你决定的项目".to_string()
+            }
         );
     }
 }
@@ -3844,6 +3840,7 @@ mod tests {
             status: "ready".to_string(),
             codex_binary: None,
             execute_dialog: None,
+            show_resource_detail: false,
             background: Arc::new(Mutex::new(BackgroundState::default())),
         }
     }
@@ -3874,7 +3871,14 @@ mod tests {
             table_viewport_height(STORAGE_ITEMS_PER_PAGE),
             Dp::new(expected)
         );
-        assert!(table_viewport_height(HISTORY_ITEMS_PER_PAGE).0 > 304.0);
+        assert_eq!(
+            table_viewport_height(HISTORY_ITEMS_PER_PAGE),
+            Dp::new(
+                metrics.header_height.0
+                    + metrics.row_height.0 * HISTORY_ITEMS_PER_PAGE as f32
+                    + 1.0
+            )
+        );
     }
 
     #[test]
@@ -3916,7 +3920,57 @@ mod tests {
     }
 
     #[test]
-    fn every_page_has_a_dpi_safe_scroll_container() {
+    fn retention_profile_opens_decisions_and_advances_after_a_choice() {
+        let mut state = empty_state(Page::Conversations);
+        let selected = session(
+            "task-1",
+            "任务",
+            cleaner_core::SessionStatus::Active,
+            "C:/work",
+            None,
+        );
+        let review_resource = |id| cleaner_core::ResourceNode {
+            id,
+            location: cleaner_core::ResourceLocation::Path {
+                path: PathBuf::from(format!("C:/unknown-{id}.dat")),
+            },
+            kind: ResourceKind::SupportLibrary,
+            artifact_stage: None,
+            artifact_reason: None,
+            size: 1,
+            size_complete: true,
+            ownership: cleaner_core::Ownership::Unknown,
+            confidence: cleaner_core::Confidence::Weak,
+            evidence: vec![],
+            recommended_action: ResourceAction::Review,
+            user_override: None,
+            action: ResourceAction::Review,
+        };
+        state.analysis = Some(SessionAnalysis {
+            session: selected,
+            related_session_ids: vec![],
+            related_transcript_bytes: 0,
+            project_related_session_ids: vec![],
+            duplicate_title_session_ids: vec![],
+            project_transcript_bytes: 0,
+            resources: vec![review_resource(1), review_resource(2)],
+            profile: RetentionProfile::ResultsAndSource,
+            analyzed_bytes: 0,
+            truncated: false,
+            warnings: vec![],
+        });
+
+        apply_profile(&mut state, RetentionProfile::ResultsAndSource);
+
+        assert_eq!(state.resource_filter, ResourceFilter::Decide);
+        assert_eq!(state.selected_resource, Some(ZsTableRowId::new(1)));
+        set_selected_action(&mut state, ResourceAction::Keep);
+        assert_eq!(state.selected_resource, Some(ZsTableRowId::new(2)));
+        assert!(state.status.contains("下一项"));
+    }
+
+    #[test]
+    fn every_page_uses_a_single_screen_without_page_scrolling() {
         let cases = [
             (Page::Overview, START_SCAN_BUTTON),
             (Page::Conversations, ANALYZE_BUTTON),
@@ -3934,7 +3988,7 @@ mod tests {
             };
             node.layout(&mut ViewLayoutCx::new(bounds, Dpi::new(144.0)));
             assert_eq!(node.bounds(), Some(bounds));
-            assert_eq!(node.widget_scroll_target(target), Some(CONTENT_SCROLL));
+            assert_eq!(node.widget_scroll_target(target), None);
         }
     }
 
@@ -3945,11 +3999,8 @@ mod tests {
                 x: 0,
                 y: 0,
                 width: 1360,
-                // Toolbar dispatch is independent of the current scroll
-                // offset.  Use a tall test surface so controls below the
-                // initial viewport receive a concrete hit target; the
-                // separate page test verifies that the real viewport owns a
-                // scroll container.
+                // Use a tall surface here because this helper verifies message
+                // routing only; the separate page test enforces no page scroll.
                 height: 1600,
             },
             Dpi::standard(),
