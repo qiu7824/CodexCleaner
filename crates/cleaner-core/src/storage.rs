@@ -43,7 +43,10 @@ pub struct StorageCleanupPreview {
 
 pub fn scan_codex_storage(codex_home: impl AsRef<Path>) -> StorageReport {
     let local_app_data = env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    scan_codex_storage_at(codex_home.as_ref(), local_app_data.as_deref())
+    let mut report = scan_codex_storage_base_at(codex_home.as_ref(), local_app_data.as_deref());
+    add_installed_codex_app_packages(&mut report);
+    finalize_storage_report(&mut report);
+    report
 }
 
 pub fn apply_safe_storage_rules(report: &mut StorageReport) {
@@ -205,7 +208,14 @@ fn validate_storage_target(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn scan_codex_storage_at(codex_home: &Path, local_app_data: Option<&Path>) -> StorageReport {
+    let mut report = scan_codex_storage_base_at(codex_home, local_app_data);
+    finalize_storage_report(&mut report);
+    report
+}
+
+fn scan_codex_storage_base_at(codex_home: &Path, local_app_data: Option<&Path>) -> StorageReport {
     let mut report = StorageReport {
         roots: vec![codex_home.to_path_buf()],
         items: Vec::new(),
@@ -650,11 +660,19 @@ fn scan_codex_storage_at(codex_home: &Path, local_app_data: Option<&Path>) -> St
                 );
             }
         }
+
+        add_codex_temp_inventory(&mut report, &local.join("Temp"));
+        add_codex_crash_dumps(&mut report, &local.join("CrashDumps"));
     }
 
-    add_unclassified_top_level(&mut report, codex_home);
-    normalize_nested_item_sizes(&mut report);
+    add_user_runtime_cache(&mut report, codex_home);
 
+    add_unclassified_top_level(&mut report, codex_home);
+    report
+}
+
+fn finalize_storage_report(report: &mut StorageReport) {
+    normalize_nested_item_sizes(report);
     report.items.sort_by(|left, right| {
         right
             .size
@@ -664,7 +682,231 @@ fn scan_codex_storage_at(codex_home: &Path, local_app_data: Option<&Path>) -> St
     for (index, item) in report.items.iter_mut().enumerate() {
         item.id = (index + 1) as u64;
     }
-    report
+}
+
+fn add_installed_codex_app_packages(report: &mut StorageReport) {
+    #[cfg(not(windows))]
+    let _ = report;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-AppxPackage -Name 'OpenAI.Codex' | ForEach-Object { $_.InstallLocation }",
+            ])
+            .creation_flags(0x0800_0000)
+            .output();
+        let Ok(output) = output else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
+        let mut locations = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        locations.sort();
+        locations.dedup();
+        for location in locations {
+            let stats = path_stats(&location);
+            report.roots.push(location.clone());
+            report.total_bytes = report.total_bytes.saturating_add(stats.bytes);
+            let version = location
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "OpenAI.Codex".to_string());
+            add_known(
+                report,
+                location,
+                &format!("当前 Windows Codex 应用包 · {version}"),
+                StorageCategory::Runtime,
+                StorageSafety::Protected,
+                "这是 Windows 当前注册的 Codex 应用安装包；安装、更新和旧版本回收必须交给 Windows 应用部署服务，不能直接删除 WindowsApps 文件",
+            );
+        }
+    }
+}
+
+fn add_user_runtime_cache(report: &mut StorageReport, codex_home: &Path) {
+    let is_default_home = codex_home
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(".codex"));
+    if !is_default_home {
+        return;
+    }
+    let Some(user_root) = codex_home.parent() else {
+        return;
+    };
+    let runtime_root = user_root.join(".cache").join("codex-runtimes");
+    if !runtime_root.is_dir() {
+        return;
+    }
+
+    report.roots.push(runtime_root.clone());
+    report.total_bytes = report
+        .total_bytes
+        .saturating_add(path_stats(&runtime_root).bytes);
+    add_known(
+        report,
+        runtime_root.clone(),
+        "Codex 下载运行时的其他数据",
+        StorageCategory::Runtime,
+        StorageSafety::Protected,
+        "该目录由桌面端维护；已识别的当前版本、旧版本和安装临时项会在下面单列，父目录不会整体清理",
+    );
+
+    let Ok(entries) = fs::read_dir(&runtime_root) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let lower = name.to_ascii_lowercase();
+        let (label, category, safety, reason) = if lower == "codex-primary-runtime" {
+            (
+                format!("当前下载运行时 · {name}"),
+                StorageCategory::Runtime,
+                StorageSafety::Protected,
+                "这是桌面端当前使用的插件、文档和处理运行时，删除会导致功能失效或重新下载",
+            )
+        } else if lower.starts_with("codex-primary-runtime.previous-") {
+            (
+                format!("旧版下载运行时（需确认）· {name}"),
+                StorageCategory::Runtime,
+                StorageSafety::Review,
+                "名称明确标记为 previous，通常是更新回滚副本；仅在 Codex 退出且当前版本工作正常时人工清理",
+            )
+        } else if lower.starts_with("codex-runtime-install-") {
+            (
+                format!("运行时安装临时目录 · {name}"),
+                StorageCategory::Temporary,
+                StorageSafety::SafeAfterExit,
+                "运行时安装阶段的临时目录；Codex 完全退出且至少 7 天未更新后可重建或重新下载",
+            )
+        } else {
+            (
+                format!("未识别的下载运行时 · {name}"),
+                StorageCategory::Runtime,
+                StorageSafety::Protected,
+                "位于 Codex 专用运行时目录但用途未确认，默认保护",
+            )
+        };
+        add_known(report, entry.path(), &label, category, safety, reason);
+    }
+}
+
+fn add_codex_temp_inventory(report: &mut StorageReport, temp_root: &Path) {
+    let Ok(entries) = fs::read_dir(temp_root) else {
+        return;
+    };
+    let candidates = entries
+        .filter_map(Result::ok)
+        .filter(|entry| is_codex_temp_name(&entry.file_name().to_string_lossy()))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return;
+    }
+
+    report.roots.push(temp_root.to_path_buf());
+    let bytes = candidates
+        .iter()
+        .map(|entry| path_stats(&entry.path()).bytes)
+        .fold(0_u64, u64::saturating_add);
+    report.total_bytes = report.total_bytes.saturating_add(bytes);
+
+    for entry in candidates {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let lower = name.to_ascii_lowercase();
+        let (label, category, safety, reason) = if lower.starts_with("codex-index-") {
+            (
+                format!("Codex 索引临时项 · {name}"),
+                StorageCategory::Temporary,
+                StorageSafety::SafeAfterExit,
+                "索引构建遗留的临时目录或占位文件；Codex 完全退出且至少 7 天未更新后可重建",
+            )
+        } else if lower == "openai-docs-cache" {
+            (
+                "OpenAI 文档缓存".to_string(),
+                StorageCategory::Cache,
+                StorageSafety::SafeAfterExit,
+                "官方文档检索缓存；Codex 完全退出且至少 7 天未更新后可重新获取",
+            )
+        } else if lower.starts_with("codex-clipboard-") {
+            (
+                format!("任务剪贴板临时附件 · {name}"),
+                StorageCategory::UserAsset,
+                StorageSafety::Review,
+                "可能仍是任务图片或附件的唯一原始路径，不能仅因位于 Temp 自动删除",
+            )
+        } else {
+            (
+                format!("Codex 相关系统临时项（需确认）· {name}"),
+                StorageCategory::Temporary,
+                StorageSafety::Review,
+                "名称表明它由 Codex 或相关操作产生，但可能包含输入、预览或过程成果，只能人工核对",
+            )
+        };
+        add_known(report, entry.path(), &label, category, safety, reason);
+    }
+}
+
+fn is_codex_temp_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("codex-cleaner") || lower.starts_with("codexcleaner") {
+        return false;
+    }
+    lower.starts_with("codex-")
+        || lower.starts_with("codex_")
+        || lower.starts_with("openai-")
+        || lower.starts_with("chatgpt-")
+        || lower == "openai-docs-cache"
+}
+
+fn add_codex_crash_dumps(report: &mut StorageReport, crash_root: &Path) {
+    let Ok(entries) = fs::read_dir(crash_root) else {
+        return;
+    };
+    let candidates = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            entry.path().is_file()
+                && !name.starts_with("codexcleaner")
+                && (name.starts_with("codex.exe.")
+                    || name.starts_with("chatgpt.exe.")
+                    || name.starts_with("openai"))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return;
+    }
+
+    report.roots.push(crash_root.to_path_buf());
+    let bytes = candidates
+        .iter()
+        .map(|entry| path_stats(&entry.path()).bytes)
+        .fold(0_u64, u64::saturating_add);
+    report.total_bytes = report.total_bytes.saturating_add(bytes);
+    for entry in candidates {
+        let name = entry.file_name().to_string_lossy().to_string();
+        add_known(
+            report,
+            entry.path(),
+            &format!("Codex 崩溃转储（需确认）· {name}"),
+            StorageCategory::Diagnostic,
+            StorageSafety::Review,
+            "仅用于崩溃排查；确认不再需要提交故障信息后可人工清理",
+        );
+    }
 }
 
 fn normalize_nested_item_sizes(report: &mut StorageReport) {
@@ -1366,7 +1608,12 @@ fn path_stats(path: &Path) -> PathStats {
             })
             .unwrap_or_default();
     }
-    let mut stats = PathStats::default();
+    let mut stats = PathStats {
+        newest: fs::symlink_metadata(path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok()),
+        ..PathStats::default()
+    };
     for entry in WalkDir::new(path)
         .follow_links(false)
         .into_iter()
@@ -1570,6 +1817,83 @@ mod tests {
                 && item.safety == StorageSafety::Review
                 && item.action == StorageAction::Review
         }));
+    }
+
+    #[test]
+    fn scans_downloaded_runtimes_and_attributable_windows_temp_without_overclaiming() {
+        let profile = tempdir().unwrap();
+        let codex_home = profile.path().join(".codex");
+        let runtime_root = profile.path().join(".cache/codex-runtimes");
+        let local = profile.path().join("AppData/Local");
+        let temp = local.join("Temp");
+        let crash = local.join("CrashDumps");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::create_dir_all(runtime_root.join("codex-primary-runtime")).unwrap();
+        fs::create_dir_all(runtime_root.join("codex-primary-runtime.previous-old")).unwrap();
+        fs::create_dir_all(runtime_root.join("codex-runtime-install-stage")).unwrap();
+        fs::create_dir_all(&temp).unwrap();
+        fs::create_dir_all(&crash).unwrap();
+        fs::write(
+            runtime_root.join("codex-primary-runtime/current.bin"),
+            vec![0_u8; 1],
+        )
+        .unwrap();
+        fs::write(
+            runtime_root.join("codex-primary-runtime.previous-old/old.bin"),
+            vec![0_u8; 2],
+        )
+        .unwrap();
+        fs::write(
+            runtime_root.join("codex-runtime-install-stage/staged.bin"),
+            vec![0_u8; 3],
+        )
+        .unwrap();
+        fs::write(temp.join("codex-index-test"), vec![0_u8; 4]).unwrap();
+        fs::write(temp.join("codex-clipboard-test.png"), vec![0_u8; 5]).unwrap();
+        fs::write(temp.join("codex-cleaner-test.json"), vec![0_u8; 7]).unwrap();
+        fs::write(crash.join("Codex.exe.100.dmp"), vec![0_u8; 6]).unwrap();
+        fs::write(crash.join("CodexCleaner.exe.100.dmp"), vec![0_u8; 8]).unwrap();
+
+        let report = scan_codex_storage_at(&codex_home, Some(&local));
+
+        let find = |suffix: &str| {
+            report
+                .items
+                .iter()
+                .find(|item| item.path.ends_with(suffix))
+                .unwrap()
+        };
+        assert_eq!(
+            find("codex-primary-runtime").safety,
+            StorageSafety::Protected
+        );
+        assert_eq!(
+            find("codex-primary-runtime.previous-old").safety,
+            StorageSafety::Review
+        );
+        assert_eq!(
+            find("codex-runtime-install-stage").safety,
+            StorageSafety::SafeAfterExit
+        );
+        assert_eq!(
+            find("codex-index-test").safety,
+            StorageSafety::SafeAfterExit
+        );
+        assert_eq!(
+            find("codex-clipboard-test.png").category,
+            StorageCategory::UserAsset
+        );
+        assert_eq!(find("Codex.exe.100.dmp").safety, StorageSafety::Review);
+        assert!(!report
+            .items
+            .iter()
+            .any(|item| item.path.ends_with("codex-cleaner-test.json")
+                || item.path.ends_with("CodexCleaner.exe.100.dmp")));
+        assert_eq!(report.total_bytes, 21);
+        assert_eq!(
+            report.items.iter().map(|item| item.size).sum::<u64>(),
+            report.total_bytes
+        );
     }
 
     #[test]

@@ -25,8 +25,11 @@ Codex Cleaner 是面向普通 Windows 用户的 Codex 本地数据清理工具�
 
 ### 空间清理
 
-- 盘点 `%USERPROFILE%\.codex`、Codex 桌面运行目录和 Windows 应用包目录。
+- 盘点 `%USERPROFILE%\.codex`、Codex 桌面运行目录、Windows 应用数据目录和当前注册的 Windows 应用安装包。
+- 同时盘点 `%USERPROFILE%\.cache\codex-runtimes` 下载运行时，以及 `%LOCALAPPDATA%\Temp` 中可明确归因的 Codex 索引、剪贴板附件、文档缓存和过程临时项。
 - 分开显示对话历史、迁移备份、缓存、临时文件、日志、浏览器状态、运行组件、插件、技能、附件与任务资产。
+- 下载运行时区分当前版本、`previous-*` 回滚副本和 `codex-runtime-install-*` 安装临时目录；当前版本受保护，旧版需确认，过期安装临时目录才进入安全候选。
+- WindowsApps 中当前注册的应用包只计入占用并保持受保护；安装、更新和旧版本回收必须由 Windows 应用部署服务处理。
 - 识别 `.codex\packages\standalone\current` 正在引用的 CLI 发布包、未被引用的旧发布包、内容地址更新目录和本机运行组件副本；旧版候选只进入人工复核，不按日期自动删除。
 - 大型任务资产按任务 UUID 及目录内容继续细分为最终成果、过程成果、源码和支持库。
 - “智能选择安全项”只选择 Codex 退出后可重建、且至少 7 天未更新的缓存或临时项。

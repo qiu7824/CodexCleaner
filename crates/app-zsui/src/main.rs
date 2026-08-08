@@ -1414,7 +1414,11 @@ fn view_storage(state: &AppState) -> ViewNode<Msg> {
     column([
         body_strong("1  选择清理项目"),
         secondary_text(
-            "推荐先使用“智能选择安全项”，再检查需要核对的备份与更新残留。",
+            format!(
+                "已盘点 {} 个位置、{} 个项目；推荐先使用“智能选择安全项”，再检查需要核对的备份、系统临时项与更新残留。",
+                state.storage.roots.len(),
+                state.storage.items.len()
+            ),
             TextRole::Caption,
         ),
         cards,
